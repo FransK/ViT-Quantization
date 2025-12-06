@@ -292,15 +292,6 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     return results
 
 
-def create_calibration_loader(data_dir, batch_size=32, max_samples=512):
-    """Create a deterministic loader for calibration during PTQ."""
-    dataset = EuroSATDataset(data_dir, transform=get_eval_transform())
-    if max_samples and max_samples < len(dataset):
-        indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(0))[:max_samples]
-        dataset = Subset(dataset, indices)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
-
-
 def load_float_model_from_checkpoint(checkpoint_path: str, device: torch.device, eval_mode: bool = True):
     """Recreate a timm model from a saved checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -319,8 +310,6 @@ def apply_post_training_quantization(
     checkpoint_path: str,
     data_dir: str,
     batch_size: int = 32,
-    calibration_batches: int = 20,
-    max_calibration_samples: int = 512,
     backend: str = 'x86'
 ):
     """
@@ -682,8 +671,6 @@ if __name__ == '__main__':
                 checkpoint_path=checkpoint_path,
                 data_dir=data_dir,
                 batch_size=128,
-                calibration_batches=20,
-                max_calibration_samples=512,
                 backend='x86'
             )
         elif RUN_PTQ:
