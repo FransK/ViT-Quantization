@@ -333,6 +333,12 @@ def apply_post_training_quantization(
         {nn.Linear},  # Quantize Linear layers (main compute in ViT)
         dtype=torch.qint8
     )
+    
+    # Verify quantization coverage
+    quantized_layers = [n for n, m in quantized_model.named_modules() 
+                       if isinstance(m, torch.nn.quantized.dynamic.Linear)]
+    print(f"Dynamic Quantization applied to {len(quantized_layers)} Linear layers.")
+    
     quantized_model.eval()
 
     criterion = nn.CrossEntropyLoss()
