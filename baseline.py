@@ -15,8 +15,6 @@ from torchvision import transforms
 
 from slot_attention import SlotAttention
 
-#TODO implement dropout
-#implement low rank
 # Custom Dataset for EuroSAT
 class EuroSATDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -120,13 +118,12 @@ def create_dataloaders(data_dir, batch_size=32, train_split=0.7, val_split=0.15,
     val_subset = Subset(val_dataset, val_indices)
     test_subset = Subset(test_dataset, test_indices)
     
-    # Create dataloaders - num_workers=0 for Windows compatibility
     train_loader = DataLoader(train_subset, batch_size=batch_size, 
-                            shuffle=True, num_workers=0, pin_memory=True)
+                            shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_subset, batch_size=batch_size, 
-                          shuffle=False, num_workers=0, pin_memory=True)
+                          shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_subset, batch_size=batch_size, 
-                           shuffle=False, num_workers=0, pin_memory=True)
+                           shuffle=False, num_workers=4, pin_memory=True)
     
     return train_loader, val_loader, test_loader, train_dataset.classes
 
@@ -210,6 +207,37 @@ def compare_models(baseline_metrics, quantized_metrics, baseline_name="Baseline"
     
     print(f"{'-'*51}")
 
+def get_model_size_mb(model_path):
+    """Get model size in megabytes."""
+    if os.path.exists(model_path):
+        size_bytes = os.path.getsize(model_path)
+        return size_bytes / (1024 * 1024)
+    return 0.0
+
+def compare_model_sizes(checkpoint_path, ptq_path, qat_path):
+    """Print a comparison of model file sizes and compression ratios."""
+    paths = {
+        "Baseline (FP32)": checkpoint_path,
+        "PTQ (INT8)": ptq_path,
+        "QAT (INT8)": qat_path
+    }
+    
+    print(f"\n{'='*70}")
+    print("Model Size Comparison")
+    print(f"{'='*70}")
+    print(f"{'Model Type':<20} {'Size (MB)':>12} {'Compression Ratio':>20}")
+    print(f"{'-'*54}")
+    
+    baseline_size = get_model_size_mb(checkpoint_path)
+    
+    for name, path in paths.items():
+        size = get_model_size_mb(path)
+        if size > 0:
+            ratio = baseline_size / size if size > 0 else 0
+            print(f"{name:<20} {size:>12.2f} MB {ratio:>19.2f}x")
+        else:
+            print(f"{name:<20} {'Not Found':>12} {'-':>20}")
+    print(f"{'-'*54}")
 
 def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_size=32):
     """
@@ -289,6 +317,8 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     if 'ptq' in results and 'qat' in results:
         compare_models(results['ptq'], results['qat'], "PTQ INT8", "QAT INT8")
     
+    compare_model_sizes(checkpoint_path, ptq_path, qat_path)
+
     return results
 
 
@@ -446,7 +476,7 @@ def quantization_aware_finetune(
         running_correct = 0
         running_total = 0
 
-        for images, labels in train_loader:
+        for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = float_model(images)
@@ -458,6 +488,10 @@ def quantization_aware_finetune(
             _, preds = outputs.max(1)
             running_total += labels.size(0)
             running_correct += preds.eq(labels).sum().item()
+
+            # Print progress every 10 batches
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  [QAT] Epoch {epoch+1}/{epochs} Batch {batch_idx+1}/{len(train_loader)} Loss: {loss.item():.4f}")
 
         train_loss = running_loss / len(train_loader)
         train_acc = 100. * running_correct / running_total
@@ -647,14 +681,14 @@ if __name__ == '__main__':
         'mobilevitv2_075.cvnets_in1k',
     ]
     RUN_BASELINE_TRAINING = False
-    RUN_PTQ = True
-    RUN_QAT = True
+    RUN_PTQ = False
+    RUN_QAT = False
 
     results = {}
     
     for model_name in models_to_train:
         checkpoint_path = f'/content/drive/MyDrive/Colab Notebooks/CS 7267 Final Group Project/best_{model_name.replace("/", "_")}_eurosat.pth'
-        data_dir=r'/content/drive/MyDrive/Colab Notebooks/CS 7267 Final Group Project/EuroSAT_RGB'
+        data_dir = r'/content/drive/MyDrive/Colab Notebooks/CS 7267 Final Group Project/EuroSAT_RGB'
 
         if RUN_BASELINE_TRAINING:
             print(f"\n{'='*70}")
