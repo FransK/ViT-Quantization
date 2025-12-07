@@ -214,30 +214,230 @@ def get_model_size_mb(model_path):
         return size_bytes / (1024 * 1024)
     return 0.0
 
-def compare_model_sizes(checkpoint_path, ptq_path, qat_path):
-    """Print a comparison of model file sizes and compression ratios."""
-    paths = {
-        "Baseline (FP32)": checkpoint_path,
-        "PTQ (INT8)": ptq_path,
-        "QAT (INT8)": qat_path
+
+def get_model_memory_mb(model):
+    """
+    Calculate actual memory footprint of a model's parameters.
+    This gives accurate size regardless of how the model is saved.
+    """
+    total_bytes = 0
+    for name, param in model.named_parameters():
+        # Get the actual dtype size
+        dtype = param.dtype
+        if dtype == torch.float32:
+            bytes_per_elem = 4
+        elif dtype == torch.float16 or dtype == torch.bfloat16:
+            bytes_per_elem = 2
+        elif dtype == torch.int8 or dtype == torch.qint8 or dtype == torch.quint8:
+            bytes_per_elem = 1
+        else:
+            bytes_per_elem = param.element_size()
+        
+        total_bytes += param.numel() * bytes_per_elem
+    
+    # Also count buffers (running_mean, running_var, etc.)
+    for name, buf in model.named_buffers():
+        if buf is not None:
+            total_bytes += buf.numel() * buf.element_size()
+    
+    return total_bytes / (1024 * 1024)
+
+
+def count_quantized_params(model):
+    """
+    Count parameters by precision level in a model.
+    Returns dict with counts for FP32, INT8, and total.
+    """
+    fp32_params = 0
+    int8_params = 0
+    other_params = 0
+    
+    # Check for dynamically quantized modules
+    quantized_linear_count = 0
+    fp32_linear_count = 0
+    fp32_conv_count = 0
+    
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.quantized.dynamic.Linear):
+            quantized_linear_count += 1
+            # Quantized linear stores weights as INT8
+            if hasattr(module, 'weight'):
+                int8_params += module.weight().numel()
+        elif isinstance(module, nn.Linear):
+            fp32_linear_count += 1
+            if hasattr(module, 'weight') and module.weight is not None:
+                fp32_params += module.weight.numel()
+            if hasattr(module, 'bias') and module.bias is not None:
+                fp32_params += module.bias.numel()
+        elif isinstance(module, nn.Conv2d):
+            fp32_conv_count += 1
+            if hasattr(module, 'weight') and module.weight is not None:
+                fp32_params += module.weight.numel()
+            if hasattr(module, 'bias') and module.bias is not None:
+                fp32_params += module.bias.numel()
+    
+    total_params = fp32_params + int8_params
+    
+    # Calculate theoretical sizes
+    fp32_size_mb = (fp32_params * 4) / (1024 * 1024)  # 4 bytes per FP32
+    int8_size_mb = (int8_params * 1) / (1024 * 1024)  # 1 byte per INT8
+    total_size_mb = fp32_size_mb + int8_size_mb
+    
+    # What size would be if all params were FP32
+    baseline_size_mb = (total_params * 4) / (1024 * 1024)
+    
+    return {
+        'fp32_params': fp32_params,
+        'int8_params': int8_params,
+        'total_params': total_params,
+        'fp32_size_mb': fp32_size_mb,
+        'int8_size_mb': int8_size_mb,
+        'total_size_mb': total_size_mb,
+        'baseline_size_mb': baseline_size_mb,
+        'compression_ratio': baseline_size_mb / total_size_mb if total_size_mb > 0 else 1.0,
+        'quantized_linear_layers': quantized_linear_count,
+        'fp32_linear_layers': fp32_linear_count,
+        'fp32_conv_layers': fp32_conv_count,
+        'percent_quantized': 100 * int8_params / total_params if total_params > 0 else 0,
     }
+
+
+def print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path, static_path=None):
+    """
+    Print size comparison from pre-computed stats.
+    Memory efficient - doesn't require models to be in memory.
+    """
+    print(f"\n{'='*80}")
+    print("Model Size Comparison (Accurate Parameter Analysis)")
+    print(f"{'='*80}")
     
-    print(f"\n{'='*70}")
-    print("Model Size Comparison")
-    print(f"{'='*70}")
-    print(f"{'Model Type':<20} {'Size (MB)':>12} {'Compression Ratio':>20}")
-    print(f"{'-'*54}")
+    # Analyze baseline model
+    if 'baseline' in size_stats:
+        stats = size_stats['baseline']
+        print(f"\nBaseline FP32 Model:")
+        print(f"  Total parameters: {stats['total_params']:,}")
+        print(f"  Memory footprint: {stats['baseline_size_mb']:.2f} MB")
+        print(f"  Conv2d layers: {stats['fp32_conv_layers']}")
+        print(f"  Linear layers: {stats['fp32_linear_layers']}")
     
-    baseline_size = get_model_size_mb(checkpoint_path)
+    # Analyze PTQ model  
+    if 'ptq' in size_stats:
+        stats = size_stats['ptq']
+        print(f"\nPTQ Dynamic Quantized Model:")
+        print(f"  FP32 parameters: {stats['fp32_params']:,} ({stats['fp32_size_mb']:.2f} MB)")
+        print(f"  INT8 parameters: {stats['int8_params']:,} ({stats['int8_size_mb']:.2f} MB)")
+        print(f"  Quantized Linear layers: {stats['quantized_linear_layers']}")
+        print(f"  FP32 Conv2d layers: {stats['fp32_conv_layers']} (NOT quantized)")
+        print(f"  Actual memory: {stats['total_size_mb']:.2f} MB")
+        print(f"  True compression ratio: {stats['compression_ratio']:.2f}x")
+        print(f"  Percent of params quantized: {stats['percent_quantized']:.1f}%")
+    
+    # Analyze QAT model
+    if 'qat' in size_stats:
+        stats = size_stats['qat']
+        print(f"\nQAT Dynamic Quantized Model:")
+        print(f"  FP32 parameters: {stats['fp32_params']:,} ({stats['fp32_size_mb']:.2f} MB)")
+        print(f"  INT8 parameters: {stats['int8_params']:,} ({stats['int8_size_mb']:.2f} MB)")
+        print(f"  Quantized Linear layers: {stats['quantized_linear_layers']}")
+        print(f"  FP32 Conv2d layers: {stats['fp32_conv_layers']} (NOT quantized)")
+        print(f"  Actual memory: {stats['total_size_mb']:.2f} MB")
+        print(f"  True compression ratio: {stats['compression_ratio']:.2f}x")
+        print(f"  Percent of params quantized: {stats['percent_quantized']:.1f}%")
+    
+    # File size comparison (for reference)
+    print(f"\n{'-'*80}")
+    print("File Sizes on Disk (for reference only):")
+    print(f"{'-'*80}")
+    
+    paths = {
+        "Baseline (.pth)": checkpoint_path,
+        "PTQ INT8 (.pth)": ptq_path,
+        "QAT INT8 (.pth)": qat_path,
+    }
+    if static_path and os.path.exists(static_path):
+        paths["Static INT8 (.pth)"] = static_path
     
     for name, path in paths.items():
-        size = get_model_size_mb(path)
-        if size > 0:
-            ratio = baseline_size / size if size > 0 else 0
-            print(f"{name:<20} {size:>12.2f} MB {ratio:>19.2f}x")
+        if os.path.exists(path):
+            size = get_model_size_mb(path)
+            print(f"  {name}: {size:.2f} MB")
+    
+    print(f"{'-'*80}")
+
+
+def compare_model_sizes(checkpoint_path, ptq_path, qat_path, static_path=None, ptq_model=None, qat_model=None, baseline_model=None):
+    """
+    Print a comparison of model sizes and compression ratios.
+    Uses actual parameter analysis for accurate measurements.
+    """
+    print(f"\n{'='*80}")
+    print("Model Size Comparison (Accurate Parameter Analysis)")
+    print(f"{'='*80}")
+    
+    results = {}
+    
+    # Analyze baseline model
+    if baseline_model is not None:
+        stats = count_quantized_params(baseline_model)
+        results['Baseline (FP32)'] = stats
+        print(f"\nBaseline FP32 Model:")
+        print(f"  Total parameters: {stats['total_params']:,}")
+        print(f"  Memory footprint: {stats['baseline_size_mb']:.2f} MB")
+        print(f"  Conv2d layers: {stats['fp32_conv_layers']}")
+        print(f"  Linear layers: {stats['fp32_linear_layers']}")
+    
+    # Analyze PTQ model  
+    if ptq_model is not None:
+        stats = count_quantized_params(ptq_model)
+        results['PTQ (Dynamic)'] = stats
+        print(f"\nPTQ Dynamic Quantized Model:")
+        print(f"  FP32 parameters: {stats['fp32_params']:,} ({stats['fp32_size_mb']:.2f} MB)")
+        print(f"  INT8 parameters: {stats['int8_params']:,} ({stats['int8_size_mb']:.2f} MB)")
+        print(f"  Quantized Linear layers: {stats['quantized_linear_layers']}")
+        print(f"  FP32 Conv2d layers: {stats['fp32_conv_layers']} (NOT quantized)")
+        print(f"  Actual memory: {stats['total_size_mb']:.2f} MB")
+        print(f"  True compression ratio: {stats['compression_ratio']:.2f}x")
+        print(f"  Percent of params quantized: {stats['percent_quantized']:.1f}%")
+    
+    # Analyze QAT model
+    if qat_model is not None:
+        stats = count_quantized_params(qat_model)
+        results['QAT (Dynamic)'] = stats
+        print(f"\nQAT Dynamic Quantized Model:")
+        print(f"  FP32 parameters: {stats['fp32_params']:,} ({stats['fp32_size_mb']:.2f} MB)")
+        print(f"  INT8 parameters: {stats['int8_params']:,} ({stats['int8_size_mb']:.2f} MB)")
+        print(f"  Quantized Linear layers: {stats['quantized_linear_layers']}")
+        print(f"  FP32 Conv2d layers: {stats['fp32_conv_layers']} (NOT quantized)")
+        print(f"  Actual memory: {stats['total_size_mb']:.2f} MB")
+        print(f"  True compression ratio: {stats['compression_ratio']:.2f}x")
+        print(f"  Percent of params quantized: {stats['percent_quantized']:.1f}%")
+    
+    # File size comparison (for reference)
+    print(f"\n{'-'*80}")
+    print("File Sizes on Disk (less accurate - includes serialization overhead):")
+    print(f"{'-'*80}")
+    print(f"{'Model Type':<25} {'File Size':>12} {'Note':<40}")
+    print(f"{'-'*80}")
+    
+    paths = {
+        "Baseline (.pth)": checkpoint_path,
+        "PTQ INT8 (.pth)": ptq_path,
+        "QAT INT8 (.pth)": qat_path,
+    }
+    if static_path:
+        paths["Static INT8 (.pth)"] = static_path
+    
+    for name, path in paths.items():
+        if os.path.exists(path):
+            size = get_model_size_mb(path)
+            note = "(includes optimizer state)" if "Baseline" in name else ""
+            print(f"{name:<25} {size:>10.2f} MB {note}")
         else:
-            print(f"{name:<20} {'Not Found':>12} {'-':>20}")
-    print(f"{'-'*54}")
+            print(f"{name:<25} {'Not Found':>12}")
+    
+    print(f"{'-'*80}")
+    
+    return results
 
 def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_size=32):
     """
@@ -247,12 +447,17 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     _, _, test_loader, classes = create_dataloaders(data_dir, batch_size=batch_size)
     
     results = {}
+    size_stats = {}  # Store size stats instead of keeping models in memory
     
     # Evaluate baseline (FP32)
     if os.path.exists(checkpoint_path):
         print("\nLoading baseline FP32 model...")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         baseline_model, checkpoint = load_float_model_from_checkpoint(checkpoint_path, device=device)
+        
+        # Get size stats immediately, then we can delete if needed
+        size_stats['baseline'] = count_quantized_params(baseline_model)
+        
         results['baseline'] = print_classification_report(
             baseline_model, test_loader, device, classes, 
             model_name=f"Baseline FP32 ({checkpoint['model_name']})"
@@ -272,8 +477,13 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
         # Recreate dynamically quantized model
         float_model, _ = load_float_model_from_checkpoint(checkpoint_path, device=torch.device('cpu'))
         ptq_model = quantize_dynamic(float_model, {nn.Linear}, dtype=torch.qint8)
+        del float_model  # Free memory immediately
+        
         ptq_model.load_state_dict(ptq_checkpoint['model_state_dict'])
         ptq_model.eval()
+        
+        # Get size stats immediately
+        size_stats['ptq'] = count_quantized_params(ptq_model)
         
         # Create CPU test loader
         _, _, cpu_test_loader, _ = create_dataloaders(data_dir, batch_size=batch_size)
@@ -295,8 +505,13 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
         # Recreate dynamically quantized model
         float_model, _ = load_float_model_from_checkpoint(checkpoint_path, device=torch.device('cpu'))
         qat_model = quantize_dynamic(float_model, {nn.Linear}, dtype=torch.qint8)
+        del float_model  # Free memory immediately
+        
         qat_model.load_state_dict(qat_checkpoint['model_state_dict'])
         qat_model.eval()
+        
+        # Get size stats immediately
+        size_stats['qat'] = count_quantized_params(qat_model)
         
         _, _, cpu_test_loader, _ = create_dataloaders(data_dir, batch_size=batch_size)
         results['qat'] = print_classification_report(
@@ -306,6 +521,35 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
         del qat_model
     else:
         print(f"QAT checkpoint not found: {qat_path}")
+    
+    # Add check for Static Quantization path
+    static_path = checkpoint_path.replace('.pth', '_static_int8.pth')
+    
+    # Evaluate Static model (Eager Mode Static Quantization - must run on CPU)
+    if os.path.exists(static_path):
+        print("\nLoading Static INT8 model...")
+        static_checkpoint = torch.load(static_path, map_location='cpu')
+        backend = static_checkpoint.get('backend', 'x86')
+        torch.backends.quantized.engine = backend
+        
+        # To load a static quantized model, we must rebuild the quantized structure
+        float_model, _ = load_float_model_from_checkpoint(checkpoint_path, device=torch.device('cpu'))
+        static_model = QuantizableModelWrapper(float_model)
+        static_model.qconfig = torch.ao.quantization.get_default_qconfig(backend)
+        torch.ao.quantization.prepare(static_model, inplace=True)
+        torch.ao.quantization.convert(static_model, inplace=True)
+        
+        static_model.load_state_dict(static_checkpoint['model_state_dict'])
+        static_model.eval()
+        
+        _, _, cpu_test_loader, _ = create_dataloaders(data_dir, batch_size=batch_size)
+        results['static'] = print_classification_report(
+            static_model, cpu_test_loader, torch.device('cpu'), classes,
+            model_name="Static PTQ (Eager)"
+        )
+        del static_model
+    else:
+        print(f"Static checkpoint not found: {static_path}")
     
     # Print comparisons
     if 'baseline' in results and 'ptq' in results:
@@ -317,7 +561,12 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     if 'ptq' in results and 'qat' in results:
         compare_models(results['ptq'], results['qat'], "PTQ INT8", "QAT INT8")
     
-    compare_model_sizes(checkpoint_path, ptq_path, qat_path)
+    if 'baseline' in results and 'static' in results:
+        compare_models(results['baseline'], results['static'], "Baseline FP32", "Static INT8")
+    
+    # Print size comparison from stored stats
+    print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path, static_path)
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     return results
 
@@ -675,20 +924,191 @@ def train_eurosat(
     return model, test_acc
 
 
+def apply_onnx_quantization(
+    checkpoint_path: str,
+    data_dir: str,
+    batch_size: int = 32,
+    calibration_batches: int = 10
+):
+    """
+    Export to ONNX and apply ONNX Runtime quantization.
+    
+    This handles complex architectures that PyTorch native quantization cannot,
+    including MobileViT with its residual connections and dynamic control flow.
+    
+    Returns paths to FP32 and INT8 ONNX models.
+    """
+    try:
+        import onnx
+        from onnxruntime.quantization import quantize_dynamic as onnx_quantize_dynamic
+        from onnxruntime.quantization import quantize_static as onnx_quantize_static
+        from onnxruntime.quantization import QuantType, CalibrationDataReader
+        import onnxruntime as ort
+    except ImportError:
+        print("ONNX quantization requires: pip install onnx onnxruntime")
+        return None, None, 0.0, 0.0
+    
+    print(f"\nPreparing ONNX Quantization...")
+    device = torch.device('cpu')
+    
+    # 1. Load Float Model
+    float_model, checkpoint = load_float_model_from_checkpoint(checkpoint_path, device=device)
+    float_model.eval()
+    
+    # 2. Export to ONNX
+    onnx_fp32_path = checkpoint_path.replace('.pth', '_fp32.onnx')
+    onnx_int8_path = checkpoint_path.replace('.pth', '_int8.onnx')
+    
+    print("Exporting to ONNX format...")
+    dummy_input = torch.randn(1, 3, 224, 224)
+    
+    torch.onnx.export(
+        float_model,
+        dummy_input,
+        onnx_fp32_path,
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes={
+            'input': {0: 'batch_size'},
+            'output': {0: 'batch_size'}
+        },
+        opset_version=18,
+        do_constant_folding=True,
+        dynamo=False  # Use legacy exporter for better compatibility
+    )
+    print(f"Exported FP32 ONNX model to: {onnx_fp32_path}")
+    
+    # Free memory - we don't need the PyTorch model anymore
+    del float_model
+    del dummy_input
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # 3. Quantize with ONNX Runtime Static Quantization
+    # Static quantization uses QLinearConv (not ConvInteger) which is well-supported
+    print("Applying ONNX Runtime static quantization (all ops)...")
+    
+    # Create calibration data reader
+    class ONNXCalibrationDataReader(CalibrationDataReader):
+        def __init__(self, data_loader, num_batches=10):
+            self.data_iter = iter(data_loader)
+            self.num_batches = num_batches
+            self.batch_count = 0
+            
+        def get_next(self):
+            if self.batch_count >= self.num_batches:
+                return None
+            try:
+                images, _ = next(self.data_iter)
+                self.batch_count += 1
+                return {'input': images.numpy()}
+            except StopIteration:
+                return None
+    
+    # Get calibration data - use smaller batch size for calibration to save memory
+    cal_batch_size = min(batch_size, 16)  # Limit calibration batch size
+    _, _, cal_loader, _ = create_dataloaders(data_dir, batch_size=cal_batch_size)
+    calibration_reader = ONNXCalibrationDataReader(cal_loader, num_batches=calibration_batches)
+    
+    # Static quantization with per-channel for better accuracy
+    from onnxruntime.quantization import QuantFormat, CalibrationMethod
+    
+    # Use MinMax calibration (uses less memory than Entropy)
+    onnx_quantize_static(
+        onnx_fp32_path,
+        onnx_int8_path,
+        calibration_reader,
+        quant_format=QuantFormat.QDQ,  # Use QDQ format for better compatibility
+        per_channel=False,  # Disable per-channel to reduce memory
+        weight_type=QuantType.QInt8,
+        activation_type=QuantType.QUInt8,
+        calibrate_method=CalibrationMethod.MinMax,  # Uses less memory than Entropy
+    )
+    print(f"Exported INT8 ONNX model to: {onnx_int8_path}")
+    
+    # 4. Get file sizes for comparison
+    fp32_size = os.path.getsize(onnx_fp32_path) / (1024 * 1024)
+    int8_size = os.path.getsize(onnx_int8_path) / (1024 * 1024)
+    compression_ratio = fp32_size / int8_size if int8_size > 0 else 0
+    
+    print(f"\nONNX Model Size Comparison:")
+    print(f"  FP32: {fp32_size:.2f} MB")
+    print(f"  INT8: {int8_size:.2f} MB")
+    print(f"  Compression ratio: {compression_ratio:.2f}x")
+    
+    # 5. Evaluate ONNX INT8 model using ONNX Runtime
+    print("\nEvaluating ONNX INT8 model...")
+    _, _, test_loader, classes = create_dataloaders(data_dir, batch_size=batch_size)
+    
+    # Create ONNX Runtime session - prefer CUDA if available
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    
+    # Try CUDA first, fall back to CPU
+    available_providers = ort.get_available_providers()
+    if 'CUDAExecutionProvider' in available_providers:
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        print("Using CUDA execution provider for ONNX Runtime")
+    else:
+        providers = ['CPUExecutionProvider']
+        print("Using CPU execution provider for ONNX Runtime")
+    
+    ort_session = ort.InferenceSession(onnx_int8_path, sess_options, providers=providers)
+    
+    input_name = ort_session.get_inputs()[0].name
+    
+    correct = 0
+    total = 0
+    
+    for images, labels in test_loader:
+        # Run inference
+        outputs = ort_session.run(None, {input_name: images.numpy()})
+        predictions = np.argmax(outputs[0], axis=1)
+        
+        total += labels.size(0)
+        correct += (predictions == labels.numpy()).sum()
+    
+    test_acc = 100. * correct / total
+    print(f"ONNX INT8 model accuracy: {test_acc:.2f}%")
+    
+    # 6. Also evaluate FP32 ONNX for comparison
+    print("\nEvaluating ONNX FP32 model...")
+    ort_session_fp32 = ort.InferenceSession(onnx_fp32_path, sess_options, providers=providers)
+    
+    correct_fp32 = 0
+    total_fp32 = 0
+    
+    for images, labels in test_loader:
+        outputs = ort_session_fp32.run(None, {input_name: images.numpy()})
+        predictions = np.argmax(outputs[0], axis=1)
+        
+        total_fp32 += labels.size(0)
+        correct_fp32 += (predictions == labels.numpy()).sum()
+    
+    fp32_acc = 100. * correct_fp32 / total_fp32
+    print(f"ONNX FP32 model accuracy: {fp32_acc:.2f}%")
+    print(f"Accuracy difference (INT8 - FP32): {test_acc - fp32_acc:+.2f}%")
+    
+    return onnx_int8_path, onnx_fp32_path, test_acc, fp32_acc
+
+
 if __name__ == '__main__':
     # Train models
     models_to_train = [
-        'mobilevitv2_075.cvnets_in1k',
+        'resnet18.a1_in1k',  # Small, fast, quantizes well
+        # 'resnet50.a1_in1k',  # Larger, more accurate
     ]
-    RUN_BASELINE_TRAINING = False
-    RUN_PTQ = False
+    RUN_BASELINE_TRAINING = True
+    RUN_PTQ = True
     RUN_QAT = False
-
+    RUN_ONNX = True
+    
     results = {}
     
     for model_name in models_to_train:
         checkpoint_path = f'/content/drive/MyDrive/Colab Notebooks/CS 7267 Final Group Project/best_{model_name.replace("/", "_")}_eurosat.pth'
-        data_dir = r'/content/drive/MyDrive/Colab Notebooks/CS 7267 Final Group Project/EuroSAT_RGB'
+        data_dir = '/content/EuroSAT_local'
 
         if RUN_BASELINE_TRAINING:
             print(f"\n{'='*70}")
@@ -722,7 +1142,7 @@ if __name__ == '__main__':
                 checkpoint_path=checkpoint_path,
                 data_dir=data_dir,
                 batch_size=128,
-                epochs=100,
+                epochs=10,
                 lr=1e-5,
                 weight_decay=0.0,
                 backend='x86',
@@ -731,21 +1151,32 @@ if __name__ == '__main__':
         elif RUN_QAT:
             print(f"Checkpoint {checkpoint_path} not found. Skipping QAT.")
 
-        # Run full evaluation with classification reports
-        ptq_path = checkpoint_path.replace('.pth', '_ptq_int8.pth')
-        qat_path = checkpoint_path.replace('.pth', '_qat_int8.pth')
-        
-        if os.path.exists(checkpoint_path) and (os.path.exists(ptq_path) or os.path.exists(qat_path)):
-            print(f"\n{'='*70}")
-            print("RUNNING FULL EVALUATION WITH CLASSIFICATION REPORTS")
-            print(f"{'='*70}")
-            run_full_evaluation(
+        if RUN_ONNX and os.path.exists(checkpoint_path):
+            print(f"\nRunning ONNX Quantization for {model_name}")
+            apply_onnx_quantization(
                 checkpoint_path=checkpoint_path,
-                ptq_path=ptq_path,
-                qat_path=qat_path,
                 data_dir=data_dir,
-                batch_size=128
+                batch_size=128,
+                calibration_batches=10
             )
+        elif RUN_ONNX:
+            print(f"Checkpoint {checkpoint_path} not found. Skipping ONNX quantization.")
+
+    # Run full evaluation with classification reports
+    ptq_path = checkpoint_path.replace('.pth', '_ptq_int8.pth')
+    qat_path = checkpoint_path.replace('.pth', '_qat_int8.pth')
+    
+    if os.path.exists(checkpoint_path) and (os.path.exists(ptq_path) or os.path.exists(qat_path)):
+        print(f"\n{'='*70}")
+        print("RUNNING FULL EVALUATION WITH CLASSIFICATION REPORTS")
+        print(f"{'='*70}")
+        run_full_evaluation(
+            checkpoint_path=checkpoint_path,
+            ptq_path=ptq_path,
+            qat_path=qat_path,
+            data_dir=data_dir,
+            batch_size=128
+        )
 
     if results:
         print("\n" + "="*20)
