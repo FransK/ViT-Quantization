@@ -1,6 +1,6 @@
 import copy
+import gc
 import os
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +13,9 @@ from torch.ao.quantization import quantize_dynamic
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 
-from slot_attention import SlotAttention
+import onnx
+import onnxruntime as ort
+from onnxruntime.quantization import quantize_static, QuantType, CalibrationDataReader, QuantFormat, CalibrationMethod
 
 # Custom Dataset for EuroSAT
 class EuroSATDataset(Dataset):
@@ -61,6 +63,37 @@ class TransformSubset(Dataset):
     def __len__(self):
         return len(self.subset)
 
+class ONNXCalibrationDataReader(CalibrationDataReader):
+    def __init__(self, data_loader, num_batches=10):
+        self.data_iter = iter(data_loader)
+        self.num_batches = num_batches
+        self.batch_count = 0
+        
+    def get_next(self):
+        if self.batch_count >= self.num_batches:
+            return None
+        try:
+            images, _ = next(self.data_iter)
+            self.batch_count += 1
+            return {'input': images.numpy()}
+        except StopIteration:
+            return None
+
+class QuantizationNoiseInjector(nn.Module):
+    """Simulates quantization noise during training for QAT-like behavior."""
+    def __init__(self, bits=8):
+        super().__init__()
+        self.bits = bits
+        self.enabled = True
+    
+    def forward(self, x):
+        if self.training and self.enabled:
+            # Simulate quantization noise
+            scale = x.abs().max() / (2 ** (self.bits - 1) - 1)
+            if scale > 0:
+                x_quant = torch.round(x / scale) * scale
+                return x_quant
+        return x
 
 def get_train_transform():
     return transforms.Compose([
@@ -167,7 +200,6 @@ def get_predictions(model, dataloader, device):
     
     return np.array(all_preds), np.array(all_labels)
 
-
 def print_classification_report(model, dataloader, device, classes, model_name="Model"):
     """Print detailed classification report for a model."""
     preds, labels = get_predictions(model, dataloader, device)
@@ -188,7 +220,6 @@ def print_classification_report(model, dataloader, device, classes, model_name="
         'predictions': preds,
         'labels': labels
     }
-
 
 def compare_models(baseline_metrics, quantized_metrics, baseline_name="Baseline", quantized_name="Quantized"):
     """Print comparison between baseline and quantized model metrics."""
@@ -214,14 +245,9 @@ def get_model_size_mb(model_path):
         return size_bytes / (1024 * 1024)
     return 0.0
 
-
 def get_model_memory_mb(model):
-    """
-    Calculate actual memory footprint of a model's parameters.
-    This gives accurate size regardless of how the model is saved.
-    """
     total_bytes = 0
-    for name, param in model.named_parameters():
+    for _, param in model.named_parameters():
         # Get the actual dtype size
         dtype = param.dtype
         if dtype == torch.float32:
@@ -235,13 +261,7 @@ def get_model_memory_mb(model):
         
         total_bytes += param.numel() * bytes_per_elem
     
-    # Also count buffers (running_mean, running_var, etc.)
-    for name, buf in model.named_buffers():
-        if buf is not None:
-            total_bytes += buf.numel() * buf.element_size()
-    
     return total_bytes / (1024 * 1024)
-
 
 def count_quantized_params(model):
     """
@@ -250,7 +270,6 @@ def count_quantized_params(model):
     """
     fp32_params = 0
     int8_params = 0
-    other_params = 0
     
     # Check for dynamically quantized modules
     quantized_linear_count = 0
@@ -278,7 +297,6 @@ def count_quantized_params(model):
     
     total_params = fp32_params + int8_params
     
-    # Calculate theoretical sizes
     fp32_size_mb = (fp32_params * 4) / (1024 * 1024)  # 4 bytes per FP32
     int8_size_mb = (int8_params * 1) / (1024 * 1024)  # 1 byte per INT8
     total_size_mb = fp32_size_mb + int8_size_mb
@@ -301,8 +319,7 @@ def count_quantized_params(model):
         'percent_quantized': 100 * int8_params / total_params if total_params > 0 else 0,
     }
 
-
-def print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path, static_path=None):
+def print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path):
     """
     Print size comparison from pre-computed stats.
     Memory efficient - doesn't require models to be in memory.
@@ -354,8 +371,6 @@ def print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path, stati
         "PTQ INT8 (.pth)": ptq_path,
         "QAT INT8 (.pth)": qat_path,
     }
-    if static_path and os.path.exists(static_path):
-        paths["Static INT8 (.pth)"] = static_path
     
     for name, path in paths.items():
         if os.path.exists(path):
@@ -364,8 +379,7 @@ def print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path, stati
     
     print(f"{'-'*80}")
 
-
-def compare_model_sizes(checkpoint_path, ptq_path, qat_path, static_path=None, ptq_model=None, qat_model=None, baseline_model=None):
+def compare_model_sizes(checkpoint_path, ptq_path, qat_path, ptq_model=None, qat_model=None, baseline_model=None):
     """
     Print a comparison of model sizes and compression ratios.
     Uses actual parameter analysis for accurate measurements.
@@ -424,8 +438,6 @@ def compare_model_sizes(checkpoint_path, ptq_path, qat_path, static_path=None, p
         "PTQ INT8 (.pth)": ptq_path,
         "QAT INT8 (.pth)": qat_path,
     }
-    if static_path:
-        paths["Static INT8 (.pth)"] = static_path
     
     for name, path in paths.items():
         if os.path.exists(path):
@@ -447,7 +459,7 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     _, _, test_loader, classes = create_dataloaders(data_dir, batch_size=batch_size)
     
     results = {}
-    size_stats = {}  # Store size stats instead of keeping models in memory
+    size_stats = {}
     
     # Evaluate baseline (FP32)
     if os.path.exists(checkpoint_path):
@@ -522,35 +534,6 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     else:
         print(f"QAT checkpoint not found: {qat_path}")
     
-    # Add check for Static Quantization path
-    static_path = checkpoint_path.replace('.pth', '_static_int8.pth')
-    
-    # Evaluate Static model (Eager Mode Static Quantization - must run on CPU)
-    if os.path.exists(static_path):
-        print("\nLoading Static INT8 model...")
-        static_checkpoint = torch.load(static_path, map_location='cpu')
-        backend = static_checkpoint.get('backend', 'x86')
-        torch.backends.quantized.engine = backend
-        
-        # To load a static quantized model, we must rebuild the quantized structure
-        float_model, _ = load_float_model_from_checkpoint(checkpoint_path, device=torch.device('cpu'))
-        static_model = QuantizableModelWrapper(float_model)
-        static_model.qconfig = torch.ao.quantization.get_default_qconfig(backend)
-        torch.ao.quantization.prepare(static_model, inplace=True)
-        torch.ao.quantization.convert(static_model, inplace=True)
-        
-        static_model.load_state_dict(static_checkpoint['model_state_dict'])
-        static_model.eval()
-        
-        _, _, cpu_test_loader, _ = create_dataloaders(data_dir, batch_size=batch_size)
-        results['static'] = print_classification_report(
-            static_model, cpu_test_loader, torch.device('cpu'), classes,
-            model_name="Static PTQ (Eager)"
-        )
-        del static_model
-    else:
-        print(f"Static checkpoint not found: {static_path}")
-    
     # Print comparisons
     if 'baseline' in results and 'ptq' in results:
         compare_models(results['baseline'], results['ptq'], "Baseline FP32", "PTQ INT8")
@@ -561,15 +544,11 @@ def run_full_evaluation(checkpoint_path, ptq_path, qat_path, data_dir, batch_siz
     if 'ptq' in results and 'qat' in results:
         compare_models(results['ptq'], results['qat'], "PTQ INT8", "QAT INT8")
     
-    if 'baseline' in results and 'static' in results:
-        compare_models(results['baseline'], results['static'], "Baseline FP32", "Static INT8")
-    
     # Print size comparison from stored stats
-    print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path, static_path)
+    print_size_comparison(size_stats, checkpoint_path, ptq_path, qat_path)
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     return results
-
 
 def load_float_model_from_checkpoint(checkpoint_path: str, device: torch.device, eval_mode: bool = True):
     """Recreate a timm model from a saved checkpoint."""
@@ -583,7 +562,6 @@ def load_float_model_from_checkpoint(checkpoint_path: str, device: torch.device,
     if eval_mode:
         model.eval()
     return model, checkpoint
-
 
 def apply_post_training_quantization(
     checkpoint_path: str,
@@ -640,23 +618,6 @@ def apply_post_training_quantization(
     return quantized_model, quantized_path, test_acc
 
 
-class QuantizationNoiseInjector(nn.Module):
-    """Simulates quantization noise during training for QAT-like behavior."""
-    def __init__(self, bits=8):
-        super().__init__()
-        self.bits = bits
-        self.enabled = True
-    
-    def forward(self, x):
-        if self.training and self.enabled:
-            # Simulate quantization noise
-            scale = x.abs().max() / (2 ** (self.bits - 1) - 1)
-            if scale > 0:
-                x_quant = torch.round(x / scale) * scale
-                return x_quant
-        return x
-
-
 def add_quantization_noise_hooks(model):
     """Add forward hooks to simulate quantization noise during training."""
     hooks = []
@@ -678,7 +639,6 @@ def add_quantization_noise_hooks(model):
             injectors.append(injector)
     
     return hooks, injectors
-
 
 def quantization_aware_finetune(
     checkpoint_path: str,
@@ -792,7 +752,6 @@ def quantization_aware_finetune(
     print(f"QAT fine-tuning complete. INT8 model accuracy: {test_acc:.2f}% saved to {quantized_path}")
 
     return quantized_model, quantized_path, test_acc
-
 
 def train_eurosat(
     checkpoint_path : str,
@@ -923,31 +882,12 @@ def train_eurosat(
     
     return model, test_acc
 
-
 def apply_onnx_quantization(
     checkpoint_path: str,
     data_dir: str,
     batch_size: int = 32,
     calibration_batches: int = 10
-):
-    """
-    Export to ONNX and apply ONNX Runtime quantization.
-    
-    This handles complex architectures that PyTorch native quantization cannot,
-    including MobileViT with its residual connections and dynamic control flow.
-    
-    Returns paths to FP32 and INT8 ONNX models.
-    """
-    try:
-        import onnx
-        from onnxruntime.quantization import quantize_dynamic as onnx_quantize_dynamic
-        from onnxruntime.quantization import quantize_static as onnx_quantize_static
-        from onnxruntime.quantization import QuantType, CalibrationDataReader
-        import onnxruntime as ort
-    except ImportError:
-        print("ONNX quantization requires: pip install onnx onnxruntime")
-        return None, None, 0.0, 0.0
-    
+):    
     print(f"\nPreparing ONNX Quantization...")
     device = torch.device('cpu')
     
@@ -978,49 +918,26 @@ def apply_onnx_quantization(
     )
     print(f"Exported FP32 ONNX model to: {onnx_fp32_path}")
     
-    # Free memory - we don't need the PyTorch model anymore
+    # Free memory - was running into crashes with too much memory use
     del float_model
     del dummy_input
-    import gc
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     # 3. Quantize with ONNX Runtime Static Quantization
-    # Static quantization uses QLinearConv (not ConvInteger) which is well-supported
-    print("Applying ONNX Runtime static quantization (all ops)...")
-    
-    # Create calibration data reader
-    class ONNXCalibrationDataReader(CalibrationDataReader):
-        def __init__(self, data_loader, num_batches=10):
-            self.data_iter = iter(data_loader)
-            self.num_batches = num_batches
-            self.batch_count = 0
-            
-        def get_next(self):
-            if self.batch_count >= self.num_batches:
-                return None
-            try:
-                images, _ = next(self.data_iter)
-                self.batch_count += 1
-                return {'input': images.numpy()}
-            except StopIteration:
-                return None
+    print("Applying ONNX Runtime static quantization...")
     
     # Get calibration data - use smaller batch size for calibration to save memory
     cal_batch_size = min(batch_size, 16)  # Limit calibration batch size
     _, _, cal_loader, _ = create_dataloaders(data_dir, batch_size=cal_batch_size)
     calibration_reader = ONNXCalibrationDataReader(cal_loader, num_batches=calibration_batches)
     
-    # Static quantization with per-channel for better accuracy
-    from onnxruntime.quantization import QuantFormat, CalibrationMethod
-    
-    # Use MinMax calibration (uses less memory than Entropy)
-    onnx_quantize_static(
+    quantize_static(
         onnx_fp32_path,
         onnx_int8_path,
         calibration_reader,
-        quant_format=QuantFormat.QDQ,  # Use QDQ format for better compatibility
-        per_channel=False,  # Disable per-channel to reduce memory
+        quant_format=QuantFormat.QDQ,
+        per_channel=False,
         weight_type=QuantType.QInt8,
         activation_type=QuantType.QUInt8,
         calibrate_method=CalibrationMethod.MinMax,  # Uses less memory than Entropy
@@ -1092,16 +1009,15 @@ def apply_onnx_quantization(
     
     return onnx_int8_path, onnx_fp32_path, test_acc, fp32_acc
 
-
 if __name__ == '__main__':
     # Train models
     models_to_train = [
         'mobilevitv2_075.cvnets_in1k',
         'resnet18.a1_in1k'
     ]
-    RUN_BASELINE_TRAINING = True
+    RUN_BASELINE_TRAINING = False
     RUN_PTQ = True
-    RUN_QAT = False
+    RUN_QAT = True
     RUN_ONNX = True
     
     results = {}
