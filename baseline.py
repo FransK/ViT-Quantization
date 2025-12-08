@@ -1096,8 +1096,8 @@ def apply_onnx_quantization(
 if __name__ == '__main__':
     # Train models
     models_to_train = [
-        'resnet18.a1_in1k',  # Small, fast, quantizes well
-        # 'resnet50.a1_in1k',  # Larger, more accurate
+        'mobilevitv2_075.cvnets_in1k',
+        'resnet18.a1_in1k'
     ]
     RUN_BASELINE_TRAINING = True
     RUN_PTQ = True
